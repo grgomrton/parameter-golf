@@ -106,11 +106,17 @@ By default this downloads the full validation split plus 80 training shards (8B 
 Then run a small MLX training job:
 
 ```powershell
-$env:RUN_ID = "mlx_smoke"
-$env:ITERATIONS = "200"
-$env:TRAIN_BATCH_TOKENS = "8192"
+$env:ENABLE_TORCH_COMPILE = "0"
+$env:RUN_ID = "win_smoke"
+$env:ITERATIONS = "20"
+$env:TRAIN_BATCH_TOKENS = "65536"
+$env:VAL_BATCH_SIZE = "65536"
 $env:VAL_LOSS_EVERY = "0"
-$env:VAL_BATCH_SIZE = "8192"
+$env:MODEL_DIM = "384"
+$env:NUM_LAYERS = "6"
+$env:NUM_HEADS = "6"
+$env:NUM_KV_HEADS = "3"
+
 python train_gpt_mlx.py
 ```
 
