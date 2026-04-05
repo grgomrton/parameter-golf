@@ -23,9 +23,14 @@ import numpy as np
 import sentencepiece as spm
 import torch
 import torch.distributed as dist
+import torch._dynamo
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+LOW_PRECISION_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+ENABLE_TORCH_COMPILE = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "1")))
+SUPPRESS_TORCH_COMPILE_ERRORS = bool(int(os.environ.get("SUPPRESS_TORCH_COMPILE_ERRORS", "1")))
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -97,7 +102,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.to(dtype=LOW_PRECISION_DTYPE)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -137,7 +142,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=LOW_PRECISION_DTYPE)
 
             curr = 0
             for i, p in enumerate(params):
@@ -255,7 +260,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -313,7 +318,7 @@ def tensor_nbytes(t: Tensor) -> int:
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
+    if t.dtype in {torch.float32, torch.float16, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
@@ -765,8 +770,10 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # Leave fallback kernels available so consumer GPUs can still run when
+    # Flash Attention does not support the active dtype / attention shape.
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -785,6 +792,7 @@ def main() -> None:
 
     log0(code, console=False)
     log0("=" * 100, console=False)
+    log0(f"Using low precision dtype {LOW_PRECISION_DTYPE}", console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
     log0(
@@ -835,12 +843,22 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).bfloat16()
+    ).to(device).to(dtype=LOW_PRECISION_DTYPE)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    torch._dynamo.config.suppress_errors = SUPPRESS_TORCH_COMPILE_ERRORS
+    if ENABLE_TORCH_COMPILE:
+        try:
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+            log0("torch.compile enabled", console=False)
+        except Exception as exc:
+            log0(f"torch.compile unavailable, falling back to eager mode: {exc}", console=True)
+            compiled_model = base_model
+    else:
+        log0("torch.compile disabled via ENABLE_TORCH_COMPILE=0", console=True)
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -944,7 +962,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1012,7 +1030,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()

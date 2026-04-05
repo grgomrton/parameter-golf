@@ -85,19 +85,19 @@ If you don't have a Mac with Apple Silicon, you can run an adapted version of th
 
 First, clone the repository, create a fresh Python environment, and install the packages needed for the MLX path plus dataset download:
 
-```bash
+```powershell
 git clone https://github.com/openai/parameter-golf.git
-cd parameter-golf
-python3 -m venv .venv
-source .venv/bin/activate
+Set-Location parameter-golf
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
 ```
 
 Download our cached version of FineWeb with the 1024-token vocabulary:
 
-```bash
-python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
+```powershell
+python data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
 ```
 
 This populates `./data/datasets/fineweb10B_sp1024/` and `./data/tokenizers/`.
@@ -105,16 +105,22 @@ By default this downloads the full validation split plus 80 training shards (8B 
 
 Then run a small MLX training job:
 
-```bash
-RUN_ID=mlx_smoke \
-ITERATIONS=200 \
-TRAIN_BATCH_TOKENS=8192 \
-VAL_LOSS_EVERY=0 \
-VAL_BATCH_SIZE=8192 \
-python3 train_gpt_mlx.py
+```powershell
+$env:RUN_ID = "mlx_smoke"
+$env:ITERATIONS = "200"
+$env:TRAIN_BATCH_TOKENS = "8192"
+$env:VAL_LOSS_EVERY = "0"
+$env:VAL_BATCH_SIZE = "8192"
+python train_gpt_mlx.py
 ```
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
+
+### Windows or Linux with NVIDIA GPU
+
+If you are on Windows or Linux and have an NVIDIA GPU, use the CUDA training path with `train_gpt.py` rather than `train_gpt_mlx.py`.
+
+Install PyTorch with CUDA support in a fresh Python environment first, then install the rest of the project dependencies from `requirements.txt`. For Windows, make sure you are using a PyTorch-supported 64-bit Python version such as 3.12 or 3.13, since Python 3.14 may not yet have matching wheels.
 
 ### Scaling Up to a Remote Machine
 
